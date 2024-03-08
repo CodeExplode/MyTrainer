@@ -9,7 +9,6 @@ from importlib.machinery import SourceFileLoader
 import torch
 from torch import nn, optim
 from torch.nn import Parameter
-from torch.cuda.amp import autocast
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 from transformers import CLIPTextModel
@@ -27,7 +26,7 @@ import util
 
 class Config:
     def __init__(self):
-        self.model_name = 'MyModel_v1'
+        self.model_name = 'my_model'
         self.init_model = 'v1-5-pruned-emaonly.safetensors'
         self.models_dir = 'U:/Work/Stable Diffusion/stable-diffusion-webui/models/Stable-diffusion/'
         self.vae = 'U:/Work/Stable Diffusion/stable-diffusion-webui/models/VAE/vae-ft-mse-840000-ema-pruned.vae.pt'
@@ -35,24 +34,22 @@ class Config:
         self.train_unet = True
         self.train_text = True
         self.lr_unet = 1.5e-6
-        self.lr_text = 1e-6
+        self.lr_text = 1.5e-6
         self.lr_ti = 3e-4
         self.doing_textual_inversion = False
         self.textual_inversion_token_ids = []
         self.clip_skip = 0
-        self.precision_unet = torch.float32 # torch.float16, torch.bfloat16, torch.float32
-        self.precision_text = torch.float32
-        self.precision_vae = torch.float16 # 16 bit okay if using AMP autocast and not training the VAE?  
-        self.optimizer = 'ADAMW' # 'ADAMW', 'ADAMW_8BIT'
+        self.precision_training = torch.bfloat16 # torch.float32, torch.bfloat16
+        self.precision_inference = torch.bfloat16 # torch.float16, torch.bfloat16, torch.float32
+        self.stochastic_rounding = True # only used in bf16 training precision
+        self.optimizer = 'ADAMW' # 'ADAMW', 'ADAMW_8BIT'- if changed between runs on same model will cause crash on loading optimizer state?
         self.xformers = True
-        #self.stochastic_rounding = True # not yet implemented
         self.frozen_embeddings = [ 49406, 49407 ] # 1.5 bos & eos
         self.epochs = 1000
-        self.save_frequency_models = 1 # backup frequency
-        self.save_frequency_embeddings = 3 # exports a new embedding file with a timestamp name
+        self.save_frequency_models = 1
+        self.save_frequency_embeddings = 3
         self.save_vae = False # whether to package VAE in checkpoint
         self.save_half = True # save final checkpoint in half precision
-
 config = Config()
 
 ######################
@@ -81,7 +78,6 @@ def log(message, doPrint=True, doLog=True):
 
 log(f'Starting training at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n\n')    
 
-
 ######################
 # Load the models
 ######################
@@ -99,32 +95,31 @@ if resuming:
         last_line = lines[-1].strip()
         steps = int(last_line)
 else:
-    log(f'Importing base model from {config.init_model}\n')
-    unet, text_encoder = util.import_checkpoint(config.models_dir, config.init_model)
+    log(f'Creating new model from {config.init_model}\n')
+    unet, text_encoder = util.load_checkpoint(config.models_dir, config.init_model)
 
 vae = AutoencoderKL.from_single_file(config.vae)
 
 tokenizer = util.create_tokenizer()
 scheduler = util.create_scheduler()
 
-
 ######################
 # Dataset
 ######################
 
-log(f':Loading dataset\n')
+log(f'Loading dataset\n')
 
-# ! custom DataLoader, will need to be replaced to run this code, and tokenization might need to happen in this code after the DataLoader returns captions (without taking tokenizer)
 SuperDatasetCustom = SourceFileLoader("SuperDatasetCustom", "U:/Work/Stable Diffusion/CustomDataloader/SuperDatasetCustom.py").load_module().SuperDatasetCustom
 
 dataset = SuperDatasetCustom(
     tokenizer1 = tokenizer,
     pad_tokens = True,
-    max_token_length = tokenizer.model_max_length - 2 # for 1.5 BOS and EOS
+    max_token_length = tokenizer.model_max_length - 2, # for BOS and EOS
+    timesteps = 1000,
+    preload_all_images = True,
 )
 
 log(f':Datset loaded with {len(dataset)} items\n')
-
 
 ######################
 # Embeddings
@@ -133,7 +128,6 @@ log(f':Datset loaded with {len(dataset)} items\n')
 with torch.no_grad():
     embeddings_layer = text_encoder.get_input_embeddings()
 
-    # old code from another project, hasn't been tested in this implementation yet
     if dataset.doing_textual_inversion:
         config.train_unet = False
         config.train_text = False
@@ -173,10 +167,6 @@ with torch.no_grad():
             
             num_vecs = len(emb_token_ids)
             
-            # don't think this is used any more, allowed capping how many vectors import?
-            if len(import_embedding) > 2:
-                num_vecs = import_embedding[2]
-            
             log(f'Importing embedding {emb_name} over {num_vecs} tokens for phrase {emb_text}\n')
             
             for idx, emb_token_id in enumerate(emb_token_ids):
@@ -186,7 +176,6 @@ with torch.no_grad():
 if len(dataset) == 0:
     log("Empty Dataset")
     sys.exit(1)
-
 
 #########################
 # Unfreezing
@@ -205,16 +194,12 @@ unet.train(config.train_unet)
 text_encoder.train(config.train_text or config.doing_textual_inversion)
 vae.train(False)
 
-if not config.train_unet:
-    config.precision_unet = torch.float16
+precision_unet = config.precision_training if config.train_unet else config.precision_inference
+precision_text = config.precision_training if config.train_text or config.doing_textual_inversion else config.precision_inference
 
-# if doing textual inversion, could maybe set all layers of TextEncoder except embeddings layer to fp16, but unsure if can iterate a transformers wrapper on the model
-if not config.train_text and not config.doing_textual_inversion:
-    config.precision_text = torch.float16
-
-unet = unet.to(device, dtype=config.precision_unet)
-text_encoder = text_encoder.to(device, dtype=config.precision_text)
-vae = vae.to(device, dtype=config.precision_vae) 
+unet = unet.to(device, dtype=precision_unet)
+text_encoder = text_encoder.to(device, dtype=precision_text)
+vae = vae.to(device, dtype=config.precision_inference)
 
 #########################
 # Xformers
@@ -227,9 +212,6 @@ if config.xformers and is_xformers_available():
         vae.enable_xformers_memory_efficient_attention()
     except Exception as e:
         log(f'Could not enable xformers.\n{e}\n')
-# unsure if this else needed
-#else:
-#    unet.set_attn_processor(AttnProcessor())
 
 #########################
 # Optimizer
@@ -249,16 +231,31 @@ if config.train_text:
 if config.doing_textual_inversion:
     optimizer_text = util.create_optimizer( config.optimizer, embeddings_layer.parameters(), config.lr_ti, None )
 
-#########################
+if config.precision_training == torch.bfloat16 and config.stochastic_rounding:
+    from adamw_extensions import step_adamw
+    
+    if optimizer_unet:
+        optimizer_unet.step = step_adamw.__get__(optimizer_unet, torch.optim.AdamW)
+    if optimizer_text:
+        optimizer_text.step = step_adamw.__get__(optimizer_text, torch.optim.AdamW)
+
+
+##########################
 # Training
 #########################
 
 def train_loop():
-    global steps  # need this to modify a global variable
+    global steps  # Declare steps as global to modify the global variable
     
     save_frequency = config.save_frequency_models if not config.doing_textual_inversion else config.save_frequency_embeddings
+    running_loss = 0.0
+    running_loss_smooth = 0.01
 
-    for epoch in range(1, config.epochs+1):        
+    for epoch in range(1, config.epochs+1):
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        
         with tqdm(total=len(dataset), desc=f'Epoch {epoch}') as pbar:
             for i, batch in enumerate(dataset):
                 try:
@@ -276,6 +273,11 @@ def train_loop():
                         with torch.no_grad():
                             embeddings_layer.weight.grad[ frozen_embeds_mask ] = 0
                     
+                    if config.train_unet:
+                        nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
+                    if config.train_text:
+                        nn.utils.clip_grad_norm_(text_encoder.parameters(), max_norm=1.0)
+                    
                     if optimizer_unet:
                         optimizer_unet.step()
                     
@@ -284,9 +286,12 @@ def train_loop():
                     
                     steps += 1
                     
-                    pbar.set_description(f'epoch {epoch}, steps {epoch * i}, total steps {steps}')
+                    session_steps = (epoch-1) * len(dataset) + i
+                    running_loss = running_loss_smooth * loss.item() + (1 - running_loss_smooth) * running_loss if session_steps > 0 else loss.item()
+                    
+                    pbar.set_description(f'epoch {epoch}, steps {session_steps}, total steps {steps}, loss: {loss:.4f}, running loss:{running_loss:.4f}')
                     pbar.update(1)
-                
+                    
                 except KeyboardInterrupt:
                     if not config.doing_textual_inversion:
                         print("\nTraining interrupted. Export checkpoint? (y/n): ", end='')
@@ -295,50 +300,42 @@ def train_loop():
                         
                         print("\nSave mid-epoch training?: ", end='')
                         if input().lower() == 'y':
-                            backup()
+                            save()
                     
                     sys.exit(0)
         
         log(f'\Finished epoch {epoch} at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n', doPrint=False, doLog=True)
         
         if epoch % save_frequency == 0:
-            backup()
+            save()
 
 # adapted from EveryDream2
 def calculate_loss(images, tokens):
-
     with torch.no_grad():
         latents = vae.encode(images.to(device=device, dtype=vae.dtype)).latent_dist.sample()
-        latents = latents * 0.18215
         
-        latents.to(unet.dtype)
+        latents = latents * 0.18215
+        latents = latents.to(unet.dtype)
         
         noise = torch.randn_like(latents, dtype=unet.dtype, device=device)
         
         batch_size = latents.shape[0]
         
-        timestep_end = 0
-        timestep_start = scheduler.config.num_train_timesteps
-        
         timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (batch_size,), device=device)
         timesteps = timesteps.long()
         
-        cuda_caption = tokens.to(device)
+        tokens = tokens.to(device=device) # don't cast, needs to be int or long
     
-    encoder_hidden_states = text_encoder(cuda_caption, output_hidden_states=True) # is outputting all hidden states inefficient?
-
-    if config.clip_skip > 0:
-        encoder_hidden_states = text_encoder.text_model.final_layer_norm(encoder_hidden_states.hidden_states[-config.clip_skip])
-    else:
-        encoder_hidden_states = encoder_hidden_states.last_hidden_state
+    text_encoder_output = text_encoder(tokens, return_dict=True, output_hidden_states=True)
+    embeddings = text_encoder.text_model.final_layer_norm( text_encoder_output.hidden_states[-(1 + config.clip_skip)] )
+    embeddings.to(device=device, dtype=unet.dtype)
     
     noisy_latents = scheduler.add_noise(latents, noise, timesteps)
     
-    del latents, cuda_caption
+    del latents
     
-    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-    
-    loss = torch.nn.functional.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+    model_pred = unet(noisy_latents, timesteps, embeddings).sample
+    loss = torch.nn.functional.mse_loss(model_pred.to(dtype=torch.float32), noise.to(dtype=torch.float32), reduction="mean")
     
     if config.doing_textual_inversion:
         distribution_loss = torch.tensor(0.0, device=device)
@@ -372,7 +369,7 @@ def calculate_loss(images, tokens):
     return loss
 
 
-def backup()():
+def save():
     log(f'saving backup at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n', doPrint = not config.doing_textual_inversion, doLog=True)
     
     if config.train_unet or (not resuming and not config.doing_textual_inversion):
@@ -399,7 +396,7 @@ def backup()():
 
 def export_checkpoint():
     log("exporting checkpoint\n")
-    util.export_checkpoint(config.models_dir, config.model_name, steps, unet, text_encoder, vae, config.save_vae, config.save_half)
+    util.save_checkpoint(config.models_dir, config.model_name, steps, unet, text_encoder, vae, config.save_vae, config.save_half)
     log("finished exporting checkpoint\n")
     
 train_loop()
