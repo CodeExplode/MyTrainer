@@ -4,7 +4,7 @@ import copy
 
 import torch
 from torch import optim
-from torch.cuda.amp import GradScaler
+#from torch.cuda.amp import GradScaler
 from transformers import CLIPTokenizer
 from diffusers import DDIMScheduler, AutoencoderKL
 from diffusers.pipelines.stable_diffusion.convert_from_ckpt import download_from_original_stable_diffusion_ckpt
@@ -12,7 +12,7 @@ from diffusers.pipelines.stable_diffusion.convert_from_ckpt import download_from
 from convert_diff_to_sd import ConvertToCheckpoint
 
 # From OneTrainer
-def create_optimizer( optimizer_name, parameters, learning_rate, optimizer_states_path ) -> torch.optim.Optimizer:
+def create_optimizer( optimizer_name, parameters, learning_rate, optimizer_states_path, stochastic_rounding ) -> torch.optim.Optimizer:
     optimizer = None
     
     match optimizer_name:
@@ -30,6 +30,10 @@ def create_optimizer( optimizer_name, parameters, learning_rate, optimizer_state
                 differentiable = False,
                 fused = True, # may be worse in fp16 / bf16?
             )
+            
+            if stochastic_rounding:
+                from bf16_stochastic_rounding import step_adamw
+                optimizer.step = step_adamw.__get__(optimizer, torch.optim.AdamW)
 
         case 'ADAMW_8BIT':
             import bitsandbytes as bnb
@@ -44,6 +48,33 @@ def create_optimizer( optimizer_name, parameters, learning_rate, optimizer_state
                 block_wise = True,
                 is_paged = False,
             )
+        
+        case 'ADAFACTOR':
+            from transformers.optimization import Adafactor
+            
+            relative_step = False #True
+            
+            if relative_step:
+                for parameter in parameters:
+                    if isinstance(parameter, dict) and 'lr' in parameter:
+                        parameter.pop('lr')
+
+            optimizer = Adafactor(
+                params=parameters,
+                lr = None if relative_step == True else learning_rate,
+                eps = (1e-30, 1e-3),
+                clip_threshold = 1.0,
+                decay_rate = -0.8,
+                beta1 = None,
+                weight_decay = 0.0,
+                scale_parameter = False, #True,
+                relative_step = relative_step,
+                warmup_init = False,
+            )
+            
+            if stochastic_rounding:
+                from bf16_stochastic_rounding import step_adafactor
+                optimizer.step = step_adafactor.__get__(optimizer, Adafactor)
     
     # this may break if changed optimizer between training sessions
     if os.path.exists(optimizer_states_path):
@@ -52,25 +83,9 @@ def create_optimizer( optimizer_name, parameters, learning_rate, optimizer_state
     
     return optimizer
 
-'''def create_grad_scaler(save_path):
-    scaler = GradScaler(
-            enabled=True,
-            init_scale=2**17.5,
-            growth_factor=2,
-            backoff_factor=1.0/2,
-            growth_interval=25,
-        )
-
-    if os.path.exists(save_path):
-        scaler_state = torch.load(save_path)
-        scaler.load_state_dict(scaler_state)
-    
-    return scaler'''
-
 def load_checkpoint(models_dir, model_name):
     pipeline = download_from_original_stable_diffusion_ckpt(
         checkpoint_path_or_dict = os.path.join(models_dir, model_name),
-        #original_config_file = './v1-inference.yaml', # let it infer?
         num_in_channels = 4,
         scheduler_type = "ddim",
         load_safety_checker = False,
@@ -99,8 +114,8 @@ def create_scheduler():
         prediction_type = "epsilon",
     )
     
-    # maybe not needed, was from another repo
-    scheduler.register_to_config(clip_sample = False)
+    # from another repo, maybe not needed
+    scheduler.register_to_config(clip_sample = False) # make sure scheduler works correctly with DDIM
     
     return scheduler
 
