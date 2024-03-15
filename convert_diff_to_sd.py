@@ -193,14 +193,14 @@ def convert_vae_state_dict(vae_state_dict):
     for k, v in new_state_dict.items():
         for weight_name in weights_to_convert:
             if f"mid.attn_1.{weight_name}.weight" in k:
-                print(f"Reshaping {k} for SD format")
+                #print(f"Reshaping {k} for SD format")
                 new_state_dict[k] = reshape_weight_for_sd(v)
         for weight_name, real_weight_name in vae_extra_conversion_map:
             if f"mid.attn_1.{weight_name}.weight" in k or f"mid.attn_1.{weight_name}.bias" in k:
                 keys_to_rename[k] = k.replace(weight_name, real_weight_name)
     for k, v in keys_to_rename.items():
         if k in new_state_dict:
-            print(f"Renaming {k} to {v}")
+            #print(f"Renaming {k} to {v}")
             new_state_dict[v] = reshape_weight_for_sd(new_state_dict[k])
             del new_state_dict[k]
     return new_state_dict

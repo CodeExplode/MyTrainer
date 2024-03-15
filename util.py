@@ -4,9 +4,9 @@ import copy
 
 import torch
 from torch import optim
-#from torch.cuda.amp import GradScaler
+from torch.cuda.amp import GradScaler
 from transformers import CLIPTokenizer
-from diffusers import DDIMScheduler, AutoencoderKL
+from diffusers import AutoencoderKL, DDIMScheduler, EulerAncestralDiscreteScheduler
 from diffusers.pipelines.stable_diffusion.convert_from_ckpt import download_from_original_stable_diffusion_ckpt
 
 from convert_diff_to_sd import ConvertToCheckpoint
@@ -40,13 +40,7 @@ def create_optimizer( optimizer_name, parameters, learning_rate, optimizer_state
             optimizer = bnb.optim.AdamW8bit(
                 params = parameters,
                 lr = learning_rate,
-                betas = (0.9, 0.999),
                 weight_decay = 0.01,
-                eps = 1e-8,
-                min_8bit_size = 4096,
-                percentile_clipping = 100,
-                block_wise = True,
-                is_paged = False,
             )
         
         case 'ADAFACTOR':
@@ -76,6 +70,29 @@ def create_optimizer( optimizer_name, parameters, learning_rate, optimizer_state
                 from bf16_stochastic_rounding import step_adafactor
                 optimizer.step = step_adafactor.__get__(optimizer, Adafactor)
     
+        case "LION":
+            import lion_pytorch as lp
+            optimizer = lp.Lion(
+                params = parameters,
+                lr = learning_rate,
+                betas=(0.9, 0.99),
+                weight_decay = 0,
+                use_triton = False,
+            )
+            
+        case "LION_8BIT":
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.Lion8bit(
+                params = parameters,
+                lr = learning_rate,
+                weight_decay = 0,
+                betas = (0.9, 0.999),
+                min_8bit_size = 4096,
+                percentile_clipping = 100,
+                block_wise = True,
+                is_paged = False,
+            )
+    
     # this may break if changed optimizer between training sessions
     if os.path.exists(optimizer_states_path):
         optimizer_states = torch.load(optimizer_states_path)
@@ -83,9 +100,11 @@ def create_optimizer( optimizer_name, parameters, learning_rate, optimizer_state
     
     return optimizer
 
+
 def load_checkpoint(models_dir, model_name):
     pipeline = download_from_original_stable_diffusion_ckpt(
         checkpoint_path_or_dict = os.path.join(models_dir, model_name),
+        #original_config_file = './v1-inference.yaml', # let it infer?
         num_in_channels = 4,
         scheduler_type = "ddim",
         load_safety_checker = False,
@@ -101,21 +120,28 @@ def save_checkpoint(model_dir, model_name, steps, unet, text_encoder, vae, save_
 def create_tokenizer():
     return CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", local_files_only = False)
 
-def create_scheduler():
-    scheduler = DDIMScheduler(
-        beta_start = 0.00085,
-        beta_end = 0.0120,
-        beta_schedule = "scaled_linear",
-        trained_betas=None,
-        num_train_timesteps = 1000,
-        steps_offset = 1,
-        clip_sample = False,
-        set_alpha_to_one = False,
-        prediction_type = "epsilon",
-    )
+def create_scheduler(name = "DDIM"):
+    scheduler = None
+
+    match name:
+        case 'DDIM':
+            scheduler = DDIMScheduler(
+                beta_start = 0.00085,
+                beta_end = 0.0120,
+                beta_schedule = "scaled_linear",
+                trained_betas=None,
+                num_train_timesteps = 1000,
+                steps_offset = 1,
+                clip_sample = False,
+                set_alpha_to_one = False,
+                prediction_type = "epsilon",
+            )
+            
+            # maybe not needed, from another repo
+            scheduler.register_to_config(clip_sample = False) # make sure scheduler works correctly with DDIM
     
-    # from another repo, maybe not needed
-    scheduler.register_to_config(clip_sample = False) # make sure scheduler works correctly with DDIM
+    if not scheduler:
+        print("Invalid scheduler name")
     
     return scheduler
 
@@ -134,6 +160,7 @@ def get_embedding_vectors(embeddings_dir, embedding_name):
     emb = next(iter(param_dict.items()))[1]
     
     vec = emb.detach().to("cuda", dtype=torch.float32)
+    #vectors = vec.shape[0]
     
     return vec
 

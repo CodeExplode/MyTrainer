@@ -9,13 +9,12 @@ from importlib.machinery import SourceFileLoader
 import torch
 from torch import nn, optim
 from torch.nn import Parameter
-from torch.cuda.amp import autocast # GradScaler
+from torch.cuda.amp import autocast
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
-#from accelerate import Accelerator
 from transformers import CLIPTextModel
 from diffusers import AutoencoderKL, UNet2DConditionModel
-from diffusers.models.attention_processor import XFormersAttnProcessor #, AttnProcessor2_0, AttnProcessor, 
+from diffusers.models.attention_processor import XFormersAttnProcessor
 from diffusers.utils import is_xformers_available
 from xformers.ops import MemoryEfficientAttentionFlashAttentionOp
 from tqdm import tqdm
@@ -28,32 +27,37 @@ import util
 
 class Config:
     def __init__(self):
-        self.model_name = 'ModelName_SD15_bf16_xf_AdamWSR_bs4'
+        self.model_name = 'my_model_v1'
         self.init_model = 'v1-5-pruned-emaonly.safetensors'
-        self.models_dir = 'U:/Work/Stable Diffusion/stable-diffusion-webui/models/Stable-diffusion/'
-        self.vae = 'U:/Work/Stable Diffusion/stable-diffusion-webui/models/VAE/vae-ft-mse-840000-ema-pruned.vae.pt'
-        self.embeddings_dir = 'U:/Work/Stable Diffusion/stable-diffusion-webui/embeddings/'
+        self.models_dir = 'U:/Work/Stable Diffusion/_models/models'
+        self.vae = 'U:/Work/Stable Diffusion/_models/vae/vae-ft-mse-840000-ema-pruned.vae.pt'
+        self.embeddings_dir = 'U:/Work/Stable Diffusion/_models/embeddings/'
         self.train_unet = True
         self.train_text = True
-        self.lr_unet = 1.5e-6
-        self.lr_text = 1.5e-6
+        self.lr_unet = 1.5e-6 # 3.5e-6  
+        self.lr_text = 1.5e-6 #3.5e-6
         self.lr_ti = 3e-4
         self.doing_textual_inversion = False
         self.textual_inversion_token_ids = []
-        self.clip_skip = 0
-        self.precision_training = torch.bfloat16 # torch.float32 or torch.bfloat16
-        self.precision_inference = torch.bfloat16 # torch.float16, torch.bfloat16, torch.float32
-        self.optimizer = 'ADAMW' # 'ADAMW', 'ADAMW_8BIT', 'ADAFACTOR' - if changed between runs on same model will cause crash on loading optimizer state?
-        self.stochastic_rounding = True # simulate higher precision updates in bf16 training precision for AdamW and ADAFACTOR
-        self.xformers = True
         self.max_batch_size = 4
-        self.frozen_embeddings = [ 49406, 49407 ] # 1.5 bos & eos
+        self.clip_skip = 0 # has a minimum of 1 applied in the code, the last hidden state as base SD1.5 uses
+        self.precision_model = torch.float32 # float32 or bfloat16 - seemingly should only ever cast the model down if can't even load it in fp32, better to just use fp32 and an 8bit optimizer otherwise
+        self.precision_training = torch.bfloat16 # float32 or bfloat16 - some parts of the process are autocast with this precision, not sure how helpful it actually is for speed or vram
+        self.precision_inference = torch.bfloat16 # torch.float16, torch.bfloat16, torch.float32
+        self.optimizer = 'ADAMW_8BIT' # 'ADAMW', 'ADAMW_8BIT', 'ADAFACTOR', "LION", "LION_8BIT" - 8bit versions seem just as good with huge savings. If changed between runs on same model will cause crash on loading optimizer state?
+        self.set_grads_to_none = True # slightly save vram, may be incompartible with stochastic_rounding implementation because a None gradient and a Zero gradient may be handled differently
+        self.stochastic_rounding = False # simulate higher precision param updates if model loaded in bf16
+        self.xformers = False # seems worse for speed & vram on pytorch 2 / rtx 3090
+        self.unet_only_train_attention = True
+        self.frozen_embeddings = [ 49406, 49407 ] # 1.5 bos & eos - try to prevent the padding tokens from being trained so much on shorter prompts
+        #self.replace_padding_token_with = '_' # try to avoid training the eos token by using another token's embedding in its place, then in inference the token won't capture that meaning
+        #self.text_embeddings_LR_multiplier = 3 # only used when finetuning the full text encoder, not textual inversion. Will try to capture more of the changes in the tokens, less in the models, essentially textual inversion while training
         self.epochs = 1000
-        self.save_frequency_models = 1 # backup frequency in epochs
+        self.save_frequency_models = 1 # backup frequency
         self.save_frequency_embeddings = 3
         self.samples_per_epoch = 8
-        self.save_vae = False # whether to package VAE in checkpoint
-        self.save_half = True # save final checkpoint in half precision, maybe can't be used if training in fp16
+        self.package_vae = True # whether to include VAE in checkpoint
+        self.package_half = True # save final checkpoint in half precision, no real downsides during inference
 config = Config()
 
 ######################
@@ -114,6 +118,8 @@ scheduler.set_timesteps(20) # for previews
 # Dataset
 ######################
 
+### will need to replace this with something which implements DataSet to use this code
+
 log(f'Loading dataset\n')
 
 SuperDatasetCustom = SourceFileLoader("SuperDatasetCustom", "U:/Work/Stable Diffusion/CustomDataloader/SuperDatasetCustom.py").load_module().SuperDatasetCustom
@@ -122,7 +128,7 @@ dataset = SuperDatasetCustom(
     tokenizer1 = tokenizer,
     pad_tokens = True,
     max_token_length = tokenizer.model_max_length - 2, # for BOS and EOS
-    batch_size = 4,
+    batch_size = config.max_batch_size,
     timesteps = 1000, # not sure if this needs to be per SD version
     keep_images_in_memory = True,
 )
@@ -134,7 +140,7 @@ log(f'Datset loaded with {len(dataset.images)} items\n')
 ######################
 
 with torch.no_grad():
-    embeddings_layer = text_encoder.get_input_embeddings()
+    embeddings_layer = text_encoder.text_model.embeddings.token_embedding
 
     if dataset.doing_textual_inversion:
         config.train_unet = False
@@ -188,6 +194,17 @@ if len(dataset.images) == 0:
     sys.exit(1)
 
 
+######################
+# Record Config
+######################
+
+log('Config:\n', doPrint=False, doLog=True)
+for key, value in config.__dict__.items():
+    log(f'{key}: {value}\n', doPrint=False, doLog=True)
+log('\n')
+
+log_file.flush()
+
 #########################
 # Unfreezing
 #########################
@@ -198,6 +215,8 @@ unet.requires_grad_(config.train_unet)
 text_encoder.requires_grad_(config.train_text)
 vae.requires_grad_(False)
 
+text_encoder.text_model.embeddings.position_embedding.requires_grad_(False) # don't think these should be trained
+
 if config.doing_textual_inversion:
     embeddings_layer.requires_grad_(True)
 
@@ -205,8 +224,8 @@ unet.train(config.train_unet)
 text_encoder.train(config.train_text or config.doing_textual_inversion)
 vae.train(False)
 
-precision_unet = config.precision_training if config.train_unet else config.precision_inference
-precision_text = config.precision_training if config.train_text or config.doing_textual_inversion else config.precision_inference
+precision_unet = config.precision_model if config.train_unet else config.precision_inference
+precision_text = config.precision_model if config.train_text or config.doing_textual_inversion else config.precision_inference
 
 unet = unet.to(device, dtype=precision_unet)
 text_encoder = text_encoder.to(device, dtype=precision_text)
@@ -229,6 +248,24 @@ if config.xformers and is_xformers_available():
 
 
 #########################
+# Experiments
+#########################
+
+if config.train_unet and config.unet_only_train_attention and not config.doing_textual_inversion:
+    unet_params_trained = 0
+    unet_total_params = 0
+    
+    for i, (name, param) in enumerate(unet.named_parameters()):
+        if 'attentions' in name:
+            param.requires_grad = True
+            unet_params_trained += 1
+        else:
+            param.requires_grad = False
+        unet_total_params += 1
+    
+    log(f'Training {unet_params_trained} / {unet_total_params} unet components')
+    
+#########################
 # Optimizer
 #########################
 
@@ -237,14 +274,16 @@ log(f'Creating optimizers\n')
 optimizer_unet = None
 optimizer_text = None
 
-if not config.precision_training == torch.bfloat16:
+if not config.precision_model == torch.bfloat16:
     config.stochastic_rounding = False
 
 if config.train_unet:
-    optimizer_unet = util.create_optimizer( config.optimizer, unet.parameters(), config.lr_unet, unet_optimizer_path, config.stochastic_rounding )
+    params = [param for param in unet.parameters() if param.requires_grad]
+    optimizer_unet = util.create_optimizer( config.optimizer, params, config.lr_unet, unet_optimizer_path, config.stochastic_rounding )
 
 if config.train_text:
-    optimizer_text = util.create_optimizer( config.optimizer, text_encoder.parameters(), config.lr_text, text_optimizer_path, config.stochastic_rounding )
+    params = [param for param in text_encoder.parameters() if param.requires_grad]
+    optimizer_text = util.create_optimizer( config.optimizer, params, config.lr_text, text_optimizer_path, config.stochastic_rounding )
 
 if config.doing_textual_inversion:
     optimizer_text = util.create_optimizer( config.optimizer, embeddings_layer.parameters(), config.lr_ti, None, config.stochastic_rounding )
@@ -254,6 +293,10 @@ if config.doing_textual_inversion:
 # Training
 #########################
 
+def clear_gc():
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def train_loop():
     log(f'Starting training at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
@@ -266,31 +309,33 @@ def train_loop():
     generate_samples(config.samples_per_epoch) # make sure the model is actually working before starting
 
     for epoch in range(1, config.epochs+1):
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+        clear_gc()
         
         dataset.start_new_epoch()
         
         with tqdm(total=len(dataset), desc=f'Epoch {epoch}') as pbar:
             for i, batch in enumerate(dataset):
                 # batch .images: list of image tensors
-                #       .tokens: all prompts in the batch encoded at once in a list, i.e. tokenizer( captions, padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt").input_ids
-                #       .noise_limits: optional list of noise limits per image, experimental
+                #       .tokens: all prompts in the batch encoded at once in a list, i.e. tokenizer( captions, padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt").input_ids (maybe move that here?)
+                #       .loss_weights: list of loss multipliers per image in batch (use a value less than 1 to slow down the learning of something, more than 1 to speed it up)
+                #       .noise_limits: optional list of noise limits per image, experimental (can use say 200-1000 on blurry images, rather than 0-1000, to avoid training blurry images for the final timesteps, but still learn from their composition)
                 
                 try:
                     if optimizer_unet:
-                        optimizer_unet.zero_grad()
+                        optimizer_unet.zero_grad(set_to_none=config.set_grads_to_none)
                     
                     if optimizer_text:
-                        optimizer_text.zero_grad()
+                        optimizer_text.zero_grad(set_to_none=config.set_grads_to_none)
                     
                     preview_vae = (i < 2)
                     
-                    # would normally be part of a collate_function in a DataLoader:
+                    ### pretend collate function:
                     batch["images"] = torch.stack(batch["images"]).to(memory_format=torch.contiguous_format).float()
+                    batch["loss_weights"] = torch.tensor(batch["loss_weights"], dtype=torch.float32, device=device)
+                    batch_size = batch["images"].shape[0]
+                    ###
                     
-                    loss = calculate_loss(batch["images"], batch["tokens"], batch["noise_limits"], preview_vae)
+                    loss = calculate_loss(batch["images"], batch["tokens"], batch["loss_weights"], batch["noise_limits"], preview_vae)
                     
                     loss.backward()
                     
@@ -299,22 +344,21 @@ def train_loop():
                             embeddings_layer.weight.grad[ frozen_embeds_mask ] = 0
                     
                     if config.train_unet:
-                        nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
+                        unet_norm_pre_clip = nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
                     if config.train_text:
-                        nn.utils.clip_grad_norm_(text_encoder.parameters(), max_norm=1.0)
+                        text_norm_pre_clip = nn.utils.clip_grad_norm_(text_encoder.parameters(), max_norm=1.0)
                     
-                    batch_size = batch["images"].shape[0]
-                    #lr_scaling = batch_size / config.max_batch_size
+                    lr_scaling = batch_size / config.max_batch_size
                     
                     if optimizer_unet:
-                        #for param_group in optimizer_unet.param_groups:
-                        #    param_group['lr'] = lr_scaling * config.lr_unet
+                        for param_group in optimizer_unet.param_groups:
+                            param_group['lr'] = lr_scaling * config.lr_unet
                     
                         optimizer_unet.step()
                     
                     if optimizer_text:
-                        #for param_group in optimizer_text.param_groups:
-                        #    param_group['lr'] = lr_scaling * (config.lr_text if not config.doing_textual_inversion else config.lr_ti)
+                        for param_group in optimizer_text.param_groups:
+                            param_group['lr'] = lr_scaling * (config.lr_text if not config.doing_textual_inversion else config.lr_ti)
                         
                         optimizer_text.step()
                     
@@ -323,11 +367,8 @@ def train_loop():
                     
                     running_loss = running_loss_smooth * loss.item() + (1 - running_loss_smooth) * running_loss if steps["session"] > 0 else loss.item()
                     
-                    pbar.set_description(f'epoch {epoch}, steps {steps["session"]}, total steps {steps["total"]}, loss: {loss:.4f}, running loss:{running_loss:.4f}')
+                    pbar.set_description(f'epoch {epoch}, steps {steps["session"]}, total steps {steps["total"]}, loss: {loss:.4f}, running loss:{running_loss:.4f}, grad norms: {unet_norm_pre_clip:.4f}, {text_norm_pre_clip:.4f}')
                     pbar.update(1)
-                    
-                    #promptsJoined = "\n".join(batch["captions"])
-                    #log(f'prompts in batch\n:{promptsJoined}\n', doPrint=False, doLog=True)
                 
                 except KeyboardInterrupt:
                     if not config.doing_textual_inversion:
@@ -341,19 +382,23 @@ def train_loop():
                     
                     return
         
-        generate_samples(config.samples_per_epoch)
+        clear_gc()
         
         log(f'Finished epoch {epoch} at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n', doPrint=False, doLog=True)
+        log_file.flush()
         
         if epoch % save_frequency == 0:
             save()
+        
+        generate_samples(config.samples_per_epoch)
 
-def calculate_loss(images, tokens, noise_limits, preview_vae = False):
+def calculate_loss(images, tokens, loss_weights, noise_limits=None, preview_vae = False):
     with torch.no_grad():
-        latents = vae.encode(images.to(device=device, dtype=vae.dtype)).latent_dist.sample()
+        with autocast(dtype = config.precision_inference): # not sure if this is useful, VAE would already be cast to this precision?
+            latents = vae.encode(images.to(device=device, dtype=vae.dtype)).latent_dist.sample()
         
         if preview_vae:
-            decoded_images = vae.decode(latents).sample
+            decoded_images = vae.decode(latents.to(vae.dtype)).sample
             decoded_images = (decoded_images + 1) * 0.5
             decoded_images = decoded_images.clamp(0, 1)
             transformPil = transforms.ToPILImage()
@@ -371,9 +416,18 @@ def calculate_loss(images, tokens, noise_limits, preview_vae = False):
         batch_size = latents.shape[0]
         
         # in theory should be adding +1 to the upper limit ("Common Diffusion Noise Schedules and Sample Steps are Flawed")
-        timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (batch_size,), device=device)
-        timesteps = timesteps.long()
+        if noise_limits is None:
+            timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (batch_size,), device=device)
+        else:
+            timesteps_list = []
+            for i in range(batch_size):
+                noise_min, noise_max = noise_limits[i]
+                timestep = torch.randint(noise_min, noise_max, (1,), device=device)
+                timesteps_list.append(timestep)
+            
+            timesteps = torch.cat(timesteps_list)
         
+        timesteps = timesteps.long()
         tokens = tokens.to(device=device) # don't cast, needs to be long
     
     text_encoder_output = text_encoder(tokens, return_dict=True, output_hidden_states=True)
@@ -384,10 +438,14 @@ def calculate_loss(images, tokens, noise_limits, preview_vae = False):
     noisy_latents = scheduler.add_noise(latents, noise, timesteps)
     
     del latents
-    
-    model_pred = unet(noisy_latents, timesteps, embeddings).sample
-    
-    loss = torch.nn.functional.mse_loss(model_pred.to(dtype=torch.float32), noise.to(dtype=torch.float32), reduction="mean")
+        
+    with autocast(dtype = config.precision_training): # not sure if this is useful or even a good idea
+        model_pred = unet(noisy_latents, timesteps, embeddings).sample
+        
+    loss = torch.nn.functional.mse_loss(model_pred.float(), noise.float(), reduction="none")
+    loss = loss.mean([1, 2, 3]) # turn into loss per item in batch (on dimension 0)
+    loss = loss * loss_weights # allow weighting the loss per item in the batch, e.g. to increase the training rate of one type of image
+    loss = loss.mean()
     
     if config.doing_textual_inversion:
         distribution_loss = torch.tensor(0.0, device=device)
@@ -413,13 +471,12 @@ def calculate_loss(images, tokens, noise_limits, preview_vae = False):
             
             if torch.abs(distribution_loss) > 1e-7:
                 old_loss = loss.item()
-                reg_strength = 0.01 #0.000001
+                reg_strength = 0.01
                 loss += distribution_loss * reg_strength
                 
                 log(f'distribution loss: {distribution_loss.item()}, old loss: {old_loss}, new loss: {loss.item()}')
     
     return loss
-
 
 def save():
     log(f'saving backup at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n', doPrint = not config.doing_textual_inversion, doLog=True)
@@ -449,7 +506,7 @@ def save():
 
 def export_checkpoint():
     log("exporting checkpoint\n")
-    util.save_checkpoint(config.models_dir, config.model_name, steps["total"], unet, text_encoder, vae, config.save_vae, config.save_half)
+    util.save_checkpoint(config.models_dir, config.model_name, steps["total"], unet, text_encoder, vae, config.package_vae, config.package_half)
     log("finished exporting checkpoint\n")
 
 def generate_samples(n):
@@ -457,6 +514,8 @@ def generate_samples(n):
         return
 
     log(f'generating {n} samples')
+    
+    clear_gc()
 
     with torch.no_grad():
         unet.eval()
@@ -479,7 +538,8 @@ def generate_samples(n):
             latents = torch.randn( (1, unet.config.in_channels, h // 8, w // 8), generator=generator, )
             latents = latents.to(device, dtype=unet.dtype)
 
-            #log(f'Preview Shapes: latents:{latents.shape}, tokens:{tokens.input_ids.shape}, embeddings:{prompt_embeddings.shape}\n', doPrint=False, doLog=True)
+            if i == 0:
+                log(f'Preview Shapes: latents:{latents.shape}, tokens:{tokens.input_ids.shape}, embeddings:{prompt_embeddings.shape}\n', doPrint=False, doLog=True)
 
             for t in scheduler.timesteps:
                 latent_model_input = torch.cat([latents] * 2)# join the latents when doing classifier-free guidance to avoid doing two forward passes
@@ -491,11 +551,12 @@ def generate_samples(n):
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
+                # compute the previous noisy sample x_t -> x_t-1
                 latents = scheduler.step(noise_pred, t, latents).prev_sample
                 
             latents = 1 / 0.18215 * latents
             
-            decoded_images = vae.decode(latents).sample
+            decoded_images = vae.decode(latents.to(vae.dtype)).sample
             decoded_images = ((decoded_images + 1) * 0.5).clamp(0, 1)
             transformPil = transforms.ToPILImage()
             image = transformPil(decoded_images[0].cpu())
