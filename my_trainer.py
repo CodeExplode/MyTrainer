@@ -2,7 +2,7 @@ import os
 import sys
 import glob
 import gc
-from enum import Enum
+import numpy as np
 from datetime import datetime
 from importlib.machinery import SourceFileLoader
 
@@ -14,48 +14,50 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 from transformers import CLIPTextModel
 from diffusers import AutoencoderKL, UNet2DConditionModel
-from diffusers.models.attention_processor import XFormersAttnProcessor
+from diffusers.models.attention_processor import XFormersAttnProcessor #, AttnProcessor2_0, AttnProcessor, 
 from diffusers.utils import is_xformers_available
 from xformers.ops import MemoryEfficientAttentionFlashAttentionOp
 from tqdm import tqdm
 
 import util
 
+
 ######################
 # config
 ######################
 
+
 class Config:
     def __init__(self):
-        self.model_name = 'my_model_v1'
+        self.model_name = 'MyModel_v1'
         self.init_model = 'v1-5-pruned-emaonly.safetensors'
         self.models_dir = 'U:/Work/Stable Diffusion/_models/models'
         self.vae = 'U:/Work/Stable Diffusion/_models/vae/vae-ft-mse-840000-ema-pruned.vae.pt'
         self.embeddings_dir = 'U:/Work/Stable Diffusion/_models/embeddings/'
         self.train_unet = True
         self.train_text = True
-        self.lr_unet = 1.5e-6 # 3.5e-6  
-        self.lr_text = 1.5e-6 #3.5e-6
+        self.lr_unet = 3.5e-6 # 1.5e-6 
+        self.lr_text = 3.5e-6 # 1.5e-6
         self.lr_ti = 3e-4
         self.doing_textual_inversion = False
         self.textual_inversion_token_ids = []
-        self.max_batch_size = 4
-        self.clip_skip = 0 # has a minimum of 1 applied in the code, the last hidden state as base SD1.5 uses
+        self.max_batch_size = 4 # dataloader can return less if resolution buckets don't evenly divide by batch size
+        self.clip_skip = 0
         self.precision_model = torch.float32 # float32 or bfloat16 - seemingly should only ever cast the model down if can't even load it in fp32, better to just use fp32 and an 8bit optimizer otherwise
         self.precision_training = torch.bfloat16 # float32 or bfloat16 - some parts of the process are autocast with this precision, not sure how helpful it actually is for speed or vram
         self.precision_inference = torch.bfloat16 # torch.float16, torch.bfloat16, torch.float32
-        self.optimizer = 'ADAMW_8BIT' # 'ADAMW', 'ADAMW_8BIT', 'ADAFACTOR', "LION", "LION_8BIT" - 8bit versions seem just as good with huge savings. If changed between runs on same model will cause crash on loading optimizer state?
-        self.set_grads_to_none = True # slightly save vram, may be incompartible with stochastic_rounding implementation because a None gradient and a Zero gradient may be handled differently
+        self.optimizer = 'ADAMW_8BIT' # 'ADAMW', 'ADAMW_8BIT', 'ADAFACTOR', "LION", "LION_8BIT" - 8bit versions seem just as good with huge savings, if changed between runs on same model will cause crash on loading optimizer state?
+        self.set_grads_to_none = True # slightly save vram, may be incompatible with stochastic_rounding implementation because a None gradient and a Zero gradient may be handled differently
         self.stochastic_rounding = False # simulate higher precision param updates if model loaded in bf16
+        self.min_snr_gamma = 0 # 0 disabled, 1 for SD?, 20 max?
+        self.discard_best_losses = True # try to prevent overfitting by scaling the losses of the items which are performing the best to 0
         self.xformers = False # seems worse for speed & vram on pytorch 2 / rtx 3090
         self.unet_only_train_attention = True
         self.frozen_embeddings = [ 49406, 49407 ] # 1.5 bos & eos - try to prevent the padding tokens from being trained so much on shorter prompts
-        #self.replace_padding_token_with = '_' # try to avoid training the eos token by using another token's embedding in its place, then in inference the token won't capture that meaning
-        #self.text_embeddings_LR_multiplier = 3 # only used when finetuning the full text encoder, not textual inversion. Will try to capture more of the changes in the tokens, less in the models, essentially textual inversion while training
         self.epochs = 1000
         self.save_frequency_models = 1 # backup frequency
-        self.save_frequency_embeddings = 3
-        self.samples_per_epoch = 8
+        self.save_frequency_embeddings = 3 # export frequency
+        self.samples_per_epoch = 2
         self.package_vae = True # whether to include VAE in checkpoint
         self.package_half = True # save final checkpoint in half precision, no real downsides during inference
 config = Config()
@@ -69,7 +71,7 @@ unet_path = os.path.join(model_cache_path, 'unet')
 text_path = os.path.join(model_cache_path, 'text_encoder')
 unet_optimizer_path = os.path.join(unet_path, 'optimizer_states.pth')
 text_optimizer_path = os.path.join(text_path, 'optimizer_states.pth')
-steps_path = os.path.join(model_cache_path, 'steps.txt')
+steps_path = os.path.join(model_cache_path, 'tracker.txt')
 samples_path = os.path.join(model_cache_path, 'samples')
 
 resuming = os.path.exists(model_cache_path)
@@ -82,30 +84,30 @@ log_file = open(os.path.join(model_cache_path, 'log.txt'), 'a')
 
 def log(message, doPrint=True, doLog=True):
     if doPrint:
-        print(message)
+        print(f'{message}\n')
     if doLog:
-        log_file.write(message)
+        log_file.write(f'{message}\n')
 
-log(f'Started at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n\n')    
+log(f'Started at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
 
 ######################
 # Load the models
 ######################
 
 device = 'cuda'
-steps = { "session": 0, "total": 0 }
+tracker = { "session": 0, "total": 0, "epochs": 0, "loss_min": 0.0, "loss_median": 0.0, "loss_max": 0.0 }
 
 if resuming:
-    log(f'Resuming from previous model\n')
+    log(f'Resuming from previous model')
     unet = UNet2DConditionModel.from_pretrained( unet_path, use_safetensors=True )
     text_encoder = CLIPTextModel.from_pretrained( text_path, use_safetensors=True )
     
     with open(steps_path, 'r') as file:
         lines = file.readlines()
         last_line = lines[-1].strip()
-        steps["total"] = int(last_line)
+        tracker["total"] = int(last_line)
 else:
-    log(f'Creating new model from {config.init_model}\n')
+    log(f'Creating new model from {config.init_model}')
     unet, text_encoder = util.load_checkpoint(config.models_dir, config.init_model)
 
 vae = AutoencoderKL.from_single_file(config.vae)
@@ -120,7 +122,7 @@ scheduler.set_timesteps(20) # for previews
 
 ### will need to replace this with something which implements DataSet to use this code
 
-log(f'Loading dataset\n')
+log(f'Loading dataset')
 
 SuperDatasetCustom = SourceFileLoader("SuperDatasetCustom", "U:/Work/Stable Diffusion/CustomDataloader/SuperDatasetCustom.py").load_module().SuperDatasetCustom
 
@@ -133,7 +135,7 @@ dataset = SuperDatasetCustom(
     keep_images_in_memory = True,
 )
 
-log(f'Datset loaded with {len(dataset.images)} items\n')
+log(f'Datset loaded with {len(dataset.images)} items')
 
 ######################
 # Embeddings
@@ -153,7 +155,7 @@ with torch.no_grad():
                 if token_id not in config.textual_inversion_token_ids:
                     config.textual_inversion_token_ids.append(token_id)
         
-        log(f'Doing textual inversion for {dataset.textual_inversions} with tokens {config.textual_inversion_token_ids}\n')
+        log(f'Doing textual inversion for {dataset.textual_inversions} with tokens {config.textual_inversion_token_ids}')
         
         frozen_embeds_mask = torch.ones(len(tokenizer), dtype=torch.bool).to(device)
         frozen_embeds_mask[config.textual_inversion_token_ids] = False
@@ -167,10 +169,10 @@ with torch.no_grad():
         frozen_embeds_mask = None
     
     if frozen_embeds_mask is not None:
-        log(f'Total embeddings: {len(frozen_embeds_mask)}, total frozen embeddings: {torch.sum(frozen_embeds_mask)}\n' )
+        log(f'Total embeddings: {len(frozen_embeds_mask)}, total frozen embeddings: {torch.sum(frozen_embeds_mask)}' )
 
     if len(dataset.import_embeddings) > 0:
-        log(f'Inserting embeddings {dataset.import_embeddings}\n', doPrint=False, doLog=True)
+        log(f'Inserting embeddings {dataset.import_embeddings}', doPrint=False, doLog=True)
         
         for import_embedding in dataset.import_embeddings:
             emb_text = import_embedding[0]
@@ -182,7 +184,7 @@ with torch.no_grad():
             
             num_vecs = len(emb_token_ids)
             
-            log(f'Importing embedding {emb_name} over {num_vecs} tokens for phrase {emb_text}\n')
+            log(f'Importing embedding {emb_name} over {num_vecs} tokens for phrase {emb_text}')
             
             for idx, emb_token_id in enumerate(emb_token_ids):
                 if idx < num_vecs:
@@ -198,10 +200,9 @@ if len(dataset.images) == 0:
 # Record Config
 ######################
 
-log('Config:\n', doPrint=False, doLog=True)
+log('Config:', doPrint=False, doLog=True)
 for key, value in config.__dict__.items():
-    log(f'{key}: {value}\n', doPrint=False, doLog=True)
-log('\n')
+    log(f'{key}: {value}', doPrint=False, doLog=True)
 
 log_file.flush()
 
@@ -209,13 +210,13 @@ log_file.flush()
 # Unfreezing
 #########################
 
-log('Unfreezing Models\n')
+log('Unfreezing Models')
 
 unet.requires_grad_(config.train_unet)
 text_encoder.requires_grad_(config.train_text)
 vae.requires_grad_(False)
 
-text_encoder.text_model.embeddings.position_embedding.requires_grad_(False) # don't think these should be trained
+text_encoder.text_model.embeddings.position_embedding.requires_grad_(False) # these are determined by some wizard science and probably shouldn't be changed
 
 if config.doing_textual_inversion:
     embeddings_layer.requires_grad_(True)
@@ -231,18 +232,17 @@ unet = unet.to(device, dtype=precision_unet)
 text_encoder = text_encoder.to(device, dtype=precision_text)
 vae = vae.to(device, dtype=config.precision_inference)
 
-
 #########################
 # Xformers
 #########################
 
 if config.xformers and is_xformers_available():
-    log('Applying xformers\n')
+    log('Applying xformers')
     try:
         unet.set_attn_processor(XFormersAttnProcessor())
         vae.enable_xformers_memory_efficient_attention()
     except Exception as e:
-        log(f'Could not enable xformers.\n{e}\n')
+        log(f'Could not enable xformers.\n{e}')
 #else:
 #    unet.set_attn_processor(AttnProcessor())
 
@@ -264,12 +264,26 @@ if config.train_unet and config.unet_only_train_attention and not config.doing_t
         unet_total_params += 1
     
     log(f'Training {unet_params_trained} / {unet_total_params} unet components')
+
+if config.min_snr_gamma:
+    min_snr_values = util.get_min_snr_values(scheduler, device)
     
+    # print out the timestep where SNR loss weights become 1.0
+    test_snr_timesteps = torch.arange(1, scheduler.config.num_train_timesteps, device=device)
+    test_snr_weights = util.min_snr_weights(test_snr_timesteps, config.min_snr_gamma, min_snr_values, device)
+    test_snr_indices = torch.nonzero(test_snr_weights == 1.0, as_tuple=False)
+    test_snr_inflection = test_snr_timesteps[test_snr_indices[0].item()]
+    log(f'SNR with gamma {config.min_snr_gamma} has full loss weights after timestep {test_snr_inflection}')
+
+if config.discard_best_losses:
+    loss_adjuster = util.Historical_Loss_Cutoff(num_buckets=10, bucket_capacity=min(200, len(dataset.images)), num_timesteps=scheduler.config.num_train_timesteps, cutoff_percentile = 10, cutoff_during_warmup = resuming)
+
+
 #########################
 # Optimizer
 #########################
 
-log(f'Creating optimizers\n')
+log(f'Creating optimizers')
 
 optimizer_unet = None
 optimizer_text = None
@@ -299,8 +313,8 @@ def clear_gc():
     torch.cuda.empty_cache()
 
 def train_loop():
-    log(f'Starting training at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
-    log(f'Num Images: {len(dataset.images)}\n\n')
+    log(f'Starting training at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    log(f'Num Images: {len(dataset.images)}')
 
     save_frequency = config.save_frequency_models if not config.doing_textual_inversion else config.save_frequency_embeddings
     running_loss = 0.0
@@ -313,12 +327,11 @@ def train_loop():
         
         dataset.start_new_epoch()
         
-        with tqdm(total=len(dataset), desc=f'Epoch {epoch}') as pbar:
+        with tqdm(total=len(dataset), desc=f'Epoch {epoch}') as progress_bar:
             for i, batch in enumerate(dataset):
                 # batch .images: list of image tensors
                 #       .tokens: all prompts in the batch encoded at once in a list, i.e. tokenizer( captions, padding="max_length", truncation=True, max_length=tokenizer.model_max_length, return_tensors="pt").input_ids (maybe move that here?)
-                #       .loss_weights: list of loss multipliers per image in batch (use a value less than 1 to slow down the learning of something, more than 1 to speed it up)
-                #       .noise_limits: optional list of noise limits per image, experimental (can use say 200-1000 on blurry images, rather than 0-1000, to avoid training blurry images for the final timesteps, but still learn from their composition)
+                #       .noise_limits: optional list of noise limits per image, experimental
                 
                 try:
                     if optimizer_unet:
@@ -329,13 +342,13 @@ def train_loop():
                     
                     preview_vae = (i < 2)
                     
-                    ### pretend collate function:
+                    ### pretend collate_fn:
                     batch["images"] = torch.stack(batch["images"]).to(memory_format=torch.contiguous_format).float()
-                    batch["loss_weights"] = torch.tensor(batch["loss_weights"], dtype=torch.float32, device=device)
+                    #batch["loss_weights"] = torch.tensor(batch["loss_weights"], dtype=torch.float32, device=device)
                     batch_size = batch["images"].shape[0]
                     ###
                     
-                    loss = calculate_loss(batch["images"], batch["tokens"], batch["loss_weights"], batch["noise_limits"], preview_vae)
+                    loss, loss_scalars = calculate_loss(batch["images"], batch["tokens"], batch["noise_limits"], preview_vae)
                     
                     loss.backward()
                     
@@ -362,13 +375,15 @@ def train_loop():
                         
                         optimizer_text.step()
                     
-                    steps["session"] += batch_size
-                    steps["total"] += batch_size
+                    tracker["session"] += batch_size
+                    tracker["total"] += batch_size
                     
-                    running_loss = running_loss_smooth * loss.item() + (1 - running_loss_smooth) * running_loss if steps["session"] > 0 else loss.item()
+                    running_loss = running_loss_smooth * loss.item() + (1 - running_loss_smooth) * running_loss if tracker["session"] > 0 else loss.item()
                     
-                    pbar.set_description(f'epoch {epoch}, steps {steps["session"]}, total steps {steps["total"]}, loss: {loss:.4f}, running loss:{running_loss:.4f}, grad norms: {unet_norm_pre_clip:.4f}, {text_norm_pre_clip:.4f}')
-                    pbar.update(1)
+                    avg_loss_scalar = np.mean(loss_scalars) if config.discard_best_losses else 0
+                    
+                    progress_bar.set_description(f'epoch {epoch}, steps {tracker["session"]}, total steps {tracker["total"]}, loss: {loss:.4f}, running loss:{running_loss:.4f}, loss scalars: {avg_loss_scalar:.3f}, grad norms: {unet_norm_pre_clip:.4f}, {text_norm_pre_clip:.4f}')
+                    progress_bar.update(1)
                 
                 except KeyboardInterrupt:
                     if not config.doing_textual_inversion:
@@ -384,7 +399,7 @@ def train_loop():
         
         clear_gc()
         
-        log(f'Finished epoch {epoch} at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n', doPrint=False, doLog=True)
+        log(f'Finished epoch {epoch} at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', doPrint=False, doLog=True)
         log_file.flush()
         
         if epoch % save_frequency == 0:
@@ -392,9 +407,9 @@ def train_loop():
         
         generate_samples(config.samples_per_epoch)
 
-def calculate_loss(images, tokens, loss_weights, noise_limits=None, preview_vae = False):
+def calculate_loss(images, tokens, noise_limits=None, preview_vae = False):
     with torch.no_grad():
-        with autocast(dtype = config.precision_inference): # not sure if this is useful, VAE would already be cast to this precision?
+        with autocast(dtype = config.precision_inference): # dtype = config.precision_inference
             latents = vae.encode(images.to(device=device, dtype=vae.dtype)).latent_dist.sample()
         
         if preview_vae:
@@ -404,8 +419,8 @@ def calculate_loss(images, tokens, loss_weights, noise_limits=None, preview_vae 
             transformPil = transforms.ToPILImage()
             
             for i, image_tensor in enumerate(decoded_images):
-                image = transformPil(image_tensor.cpu())
-                filename = os.path.join(samples_path, f'VAE_preview_step_{steps["total"]}_{i}_{datetime.now().strftime("%Y-%m-%d %H_%M_%S")}.png')
+                image = transformPil(image_tensor.cpu())  # Move tensor to CPU for PIL conversion
+                filename = os.path.join(samples_path, f'VAE_preview_step_{tracker["total"]}_{i}_{datetime.now().strftime("%Y-%m-%d %H_%M_%S")}.png')
                 image.save(filename)
         
         latents = latents * 0.18215
@@ -438,13 +453,23 @@ def calculate_loss(images, tokens, loss_weights, noise_limits=None, preview_vae 
     noisy_latents = scheduler.add_noise(latents, noise, timesteps)
     
     del latents
-        
-    with autocast(dtype = config.precision_training): # not sure if this is useful or even a good idea
+    
+    with autocast(dtype = config.precision_training): #dtype = precision_unet
         model_pred = unet(noisy_latents, timesteps, embeddings).sample
-        
+    
     loss = torch.nn.functional.mse_loss(model_pred.float(), noise.float(), reduction="none")
-    loss = loss.mean([1, 2, 3]) # turn into loss per item in batch (on dimension 0)
-    loss = loss * loss_weights # allow weighting the loss per item in the batch, e.g. to increase the training rate of one type of image
+    loss = loss.mean([1, 2, 3]) # loss per item, from [batch, channels, height, width] to [batch]
+    
+    if config.min_snr_gamma:
+        snr_weights = util.min_snr_weights(timesteps, config.min_snr_gamma, min_snr_values, device)
+        loss *= snr_weights
+    
+    if config.discard_best_losses:
+        loss_per_item = loss.detach().cpu().numpy()
+        loss_scalars = loss_adjuster.loss_scales(timesteps, loss_per_item)
+        loss_adjuster.add_losses(timesteps, loss_per_item)
+        loss = loss * torch.from_numpy(loss_scalars).to(device=device)
+    
     loss = loss.mean()
     
     if config.doing_textual_inversion:
@@ -471,15 +496,16 @@ def calculate_loss(images, tokens, loss_weights, noise_limits=None, preview_vae 
             
             if torch.abs(distribution_loss) > 1e-7:
                 old_loss = loss.item()
-                reg_strength = 0.01
+                reg_strength = 0.01 #0.000001
                 loss += distribution_loss * reg_strength
                 
                 log(f'distribution loss: {distribution_loss.item()}, old loss: {old_loss}, new loss: {loss.item()}')
     
-    return loss
+    return loss, loss_scalars
+
 
 def save():
-    log(f'saving backup at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n', doPrint = not config.doing_textual_inversion, doLog=True)
+    log(f'saving backup at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', doPrint = not config.doing_textual_inversion, doLog=True)
     
     if config.train_unet or (not resuming and not config.doing_textual_inversion):
         unet.save_pretrained( unet_path, safe_serialization=True )
@@ -501,13 +527,13 @@ def save():
             util.save_embedding_vec(util.embeddings_dir, embedding_name, ti_weights)
     else:
         with open(steps_path, 'a') as file:
-            steps_total = steps["total"]
+            steps_total = tracker["total"]
             file.write(f"{steps_total}\n")
 
 def export_checkpoint():
-    log("exporting checkpoint\n")
-    util.save_checkpoint(config.models_dir, config.model_name, steps["total"], unet, text_encoder, vae, config.package_vae, config.package_half)
-    log("finished exporting checkpoint\n")
+    log("exporting checkpoint")
+    util.save_checkpoint(config.models_dir, config.model_name, tracker["total"], unet, text_encoder, vae, config.package_vae, config.package_half)
+    log("finished exporting checkpoint")
 
 def generate_samples(n):
     if not config.samples_per_epoch:
@@ -537,17 +563,15 @@ def generate_samples(n):
             
             latents = torch.randn( (1, unet.config.in_channels, h // 8, w // 8), generator=generator, )
             latents = latents.to(device, dtype=unet.dtype)
-
-            if i == 0:
-                log(f'Preview Shapes: latents:{latents.shape}, tokens:{tokens.input_ids.shape}, embeddings:{prompt_embeddings.shape}\n', doPrint=False, doLog=True)
-
+            
             for t in scheduler.timesteps:
-                latent_model_input = torch.cat([latents] * 2)# join the latents when doing classifier-free guidance to avoid doing two forward passes
+                latent_model_input = torch.cat([latents] * 2) # join the latents when doing classifier-free guidance to avoid doing two forward passes
                 
                 latent_model_input = scheduler.scale_model_input(latent_model_input, timestep=t)
                 
                 noise_pred = unet(latent_model_input, t, encoder_hidden_states=embeddings).sample
 
+                # perform guidance
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
@@ -561,7 +585,7 @@ def generate_samples(n):
             transformPil = transforms.ToPILImage()
             image = transformPil(decoded_images[0].cpu())
             prompt = prompt[:50] if len(prompt) > 50 else prompt
-            filename = os.path.join(samples_path, f'sample_step_{steps["total"]}_{i}_{prompt}.png')
+            filename = os.path.join(samples_path, f'sample_step_{tracker["total"]}_{i}_{prompt}.png')
             image.save(filename)
             
     unet.train(config.train_unet)
